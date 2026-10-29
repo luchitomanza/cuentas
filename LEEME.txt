@@ -1,0 +1,37 @@
+MIS CUENTAS CLARAS — instalación con cuentas de usuario y sincronización
+
+A) BASE DE DATOS EN SUPABASE (una vez, gratis)
+  1. Entra a supabase.com > Start your project > crea un proyecto
+     (nombre: cuentas, región: South America (São Paulo), guarda la contraseña de la base).
+  2. Menú SQL Editor > New query > pega TODO el contenido de setup.sql > Run.
+     Debe decir "Success. No rows returned".
+  3. Project Settings > API (o botón "Connect" arriba) y copia:
+       - Project URL          (https://xxxx.supabase.co)
+       - Clave pública: "anon public" o "publishable key"
+     NO uses la clave "service_role" ni "secret".
+
+B) SUBIR LA APP A GITHUB PAGES
+  1. Abre config.js y reemplaza TU-PROYECTO y PEGA-AQUI-TU-CLAVE-PUBLICA con los datos del paso A3.
+  2. Sube todos los archivos al repositorio "cuentas" (público).
+  3. Settings > Pages > Branch: main / (root) > Save.
+     Tu enlace: https://TU-USUARIO.github.io/cuentas/
+
+C) CONECTAR LOS CORREOS DE CONFIRMACIÓN
+  En Supabase > Authentication > URL Configuration:
+     - Site URL:      https://TU-USUARIO.github.io/cuentas/
+     - Redirect URLs: agrega la misma dirección.
+  (Opcional, para no confirmar correo: Authentication > Sign In / Providers > Email >
+   desactiva "Confirm email". Es más cómodo, pero cualquiera podría registrarse con un correo ajeno.)
+
+D) USARLA
+  - Abre el enlace, toca "Crear cuenta nueva" y luego entra.
+  - Instálala: Android (Chrome) menú ⋮ > Instalar app · iPhone (Safari) Compartir > Agregar a
+    pantalla de inicio · Laptop: ícono de instalar en la barra de direcciones.
+  - Entra con la misma cuenta en todos tus equipos: los datos se sincronizan solos.
+  - Sin internet puedes seguir registrando; los cambios se suben cuando vuelve la conexión
+    (arriba verás "Sincronizado" o "N cambios por subir").
+  - Cada persona crea su propia cuenta y solo ve sus datos.
+  - Si antes usaste la versión sin cuenta en un equipo, al entrar esos datos pasan a tu cuenta.
+
+E) SI CAMBIAS ARCHIVOS MÁS ADELANTE
+  Súbelos a GitHub y en sw.js cambia "cuentas-v3" por "cuentas-v4" (y así sucesivamente).

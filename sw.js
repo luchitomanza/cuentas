@@ -1,6 +1,6 @@
 // Mis Cuentas Claras — funciona sin internet.
 // Al cambiar archivos de la app, sube el número de versión (cuentas-v4, v5…).
-const VERSION = "cuentas-v3";
+const VERSION = "cuentas-v4";
 const CORE = ["./", "./index.html", "./supabase.js", "./config.js", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 

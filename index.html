@@ -221,20 +221,24 @@ const fMonth=s=>{const[y,m]=s.split("-");return MES[+m-1]+" "+y};
 const addMonths=(s,k)=>{const[y,m,d]=s.split("-").map(Number);const t=new Date(y,m-1+k,1);const last=new Date(t.getFullYear(),t.getMonth()+1,0).getDate();return t.getFullYear()+"-"+pad(t.getMonth()+1)+"-"+pad(Math.min(d,last))};
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 
-/* ---------- Cuenta y sincronización (Supabase) ---------- */
+/* ---------- Cuenta, sincronización y grupos (Supabase) ---------- */
 const CFG=window.CUENTAS_CONFIG||{};
 const configured=!!(CFG.url&&CFG.key&&!/TU-PROYECTO|PEGA-AQUI/.test(CFG.url+CFG.key));
 const sb=configured&&window.supabase?supabase.createClient(CFG.url,CFG.key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true,flowType:"implicit"}}):null;
-let saliendo=false;let docs={};let me=null;let outbox=[];let lastPull="";let syncing=false;let lastErr=null;
+let saliendo=false;let docs={};let ajenos={};let grupos=[];let miembros=[];let me=null;let outbox=[];let lastPull="";let syncing=false;let lastErr=null;
 const enRecuperacion=/type=recovery/.test(location.hash);
 const K=s=>"cc-"+s+"-"+(me&&me.id);
 function lsGet(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
 function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 function lsDel(k){try{localStorage.removeItem(k)}catch(e){}}
-function saveLocal(){if(!me)return;lsSet(K("docs"),docs);lsSet(K("out"),outbox);lsSet(K("pull"),lastPull)}
-function queueOp(id,data){outbox=outbox.filter(o=>o.id!==id);outbox.push({id,data:data||null});saveLocal();updSync();flush()}
+function saveLocal(){if(!me)return;lsSet(K("docs"),docs);lsSet(K("ajenos"),ajenos);lsSet(K("out"),outbox);lsSet(K("pull"),lastPull)}
+function queueOp(id,data,grupo){
+  outbox=outbox.filter(o=>o.id!==id);
+  outbox.push({id,data:data||null,grupo:grupo!==undefined?grupo:((data&&data.grupo)||null)});
+  saveLocal();updSync();flush();
+}
 function put(id,data){docs={...docs,[id]:data};render();queueOp(id,data)}
-function del(id){const c={...docs};delete c[id];docs=c;render();queueOp(id,null)}
+function del(id){const g=(docs[id]&&docs[id].grupo)||null;const c={...docs};delete c[id];docs=c;render();queueOp(id,null,g)}
 function log(accion,tipo,resumen,monto){put("l-"+uid(),{t:"log",ts:new Date().toISOString(),accion,tipo,resumen,monto:monto??null})}
 function setSync(kind,txt){document.getElementById("syncDot").className="dot "+kind;document.getElementById("syncTxt").textContent=txt}
 function updSync(){
@@ -252,27 +256,60 @@ async function flush(){
   syncing=true;updSync();let ok=false;
   try{
     const batch=outbox.slice(0,200);
-    const rows=batch.map(o=>({user_id:me.id,id:o.id,data:o.data||{},deleted:!o.data}));
+    const rows=batch.map(o=>({user_id:me.id,id:o.id,data:o.data||{},deleted:!o.data,grupo_id:o.grupo||null}));
     const{error}=await sb.from("registros").upsert(rows,{onConflict:"user_id,id"});
     if(error)throw error;
     const sent=new Set(batch);outbox=outbox.filter(o=>!sent.has(o));lastErr=null;ok=true;saveLocal();
   }catch(e){netErr(e)}finally{syncing=false;updSync()}
   if(ok&&outbox.length)flush();
 }
+
+async function cargarGrupos(){
+  if(!sb||!me)return;
+  try{
+    const[g,m]=await Promise.all([
+      sb.from("grupos").select("id,nombre,creado_por").order("nombre"),
+      sb.from("grupo_miembros").select("grupo_id,user_id,email")
+    ]);
+    if(g.error)throw g.error;if(m.error)throw m.error;
+    grupos=g.data||[];miembros=m.data||[];
+    const ids=new Set(grupos.map(x=>x.id));let ch=false;
+    for(const k of Object.keys(ajenos)){if(!ids.has(ajenos[k].grupo)){delete ajenos[k];ch=true}}
+    if(ch)saveLocal();
+  }catch(e){netErr(e)}
+}
+function gNombre(id){const g=grupos.find(x=>x.id===id);return g?g.nombre:"Grupo"}
+function emailDe(uid){const m=miembros.find(x=>x.user_id===uid);return m?m.email:"otra persona"}
+async function crearGrupo(nombre){const{error}=await sb.rpc("crear_grupo",{p_nombre:nombre});if(error)throw error;await cargarGrupos();render()}
+async function invitar(gid,correo){const{error}=await sb.rpc("agregar_miembro",{p_grupo:gid,p_correo:correo});if(error)throw error;await cargarGrupos();render()}
+
 let pulling=false;
 async function pull(){
   if(!sb||!me||pulling||!navigator.onLine)return;
   pulling=true;
   try{
     await flush();
+    await cargarGrupos();
     let from=lastPull,changed=false;
     for(;;){
-      let q=sb.from("registros").select("id,data,deleted,updated_at").order("updated_at",{ascending:true}).limit(1000);
+      let q=sb.from("registros").select("id,user_id,data,deleted,updated_at").order("updated_at",{ascending:true}).limit(1000);
       if(from)q=q.gt("updated_at",from);
       const{data,error}=await q;if(error)throw error;
-      const pend=new Set(outbox.map(o=>o.id));const next={...docs};
-      for(const r of data){from=r.updated_at;if(pend.has(r.id))continue;if(r.deleted)delete next[r.id];else next[r.id]=r.data;changed=true}
-      docs=next;if(data.length<1000)break;
+      const pend=new Set(outbox.map(o=>o.id));
+      const nD={...docs},nA={...ajenos};
+      for(const r of data){
+        from=r.updated_at;
+        if(r.user_id!==me.id){
+          // registro de otra persona en uno de mis grupos
+          if(r.deleted)delete nA[r.id];else nA[r.id]={...r.data,_by:r.user_id};
+          changed=true;continue;
+        }
+        if(pend.has(r.id))continue;
+        if(r.deleted)delete nD[r.id];else nD[r.id]=r.data;
+        changed=true;
+      }
+      docs=nD;ajenos=nA;
+      if(data.length<1000)break;
     }
     lastPull=from;lastErr=null;saveLocal();if(changed)render();
   }catch(e){netErr(e)}finally{pulling=false;updSync()}
@@ -286,19 +323,22 @@ try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist()}ca
 function startSession(user){
   if(me&&me.id===user.id){showApp();return}
   me={id:user.id,email:user.email||""};lsSet("cc-last",me);
-  docs=lsGet(K("docs"),{});outbox=lsGet(K("out"),[]);lastPull=lsGet(K("pull"),"");lastErr=null;
+  docs=lsGet(K("docs"),{});ajenos=lsGet(K("ajenos"),{});outbox=lsGet(K("out"),[]);lastPull=lsGet(K("pull"),"");lastErr=null;
   // datos que quedaron de la versión sin cuenta en este equipo
   const old=lsGet("cuentas-claras-v1",null);
   if(old&&Object.keys(old).length){
     for(const[k,v]of Object.entries(old)){
-      if(v.t==="log"&&v.items){v.items.forEach(it=>{const id="l-"+uid();docs[id]={t:"log",...it};outbox.push({id,data:docs[id]})})}
-      else{docs[k]=v;outbox.push({id:k,data:v})}
+      if(v.t==="log"&&v.items){v.items.forEach(it=>{const id="l-"+uid();docs[id]={t:"log",...it};outbox.push({id,data:docs[id],grupo:null})})}
+      else{docs[k]=v;outbox.push({id:k,data:v,grupo:v.grupo||null})}
     }
     lsDel("cuentas-claras-v1");saveLocal();setTimeout(()=>toast("Se pasaron a tu cuenta los datos que tenías en este equipo"),400);
   }
   showApp();render();updSync();pull();
 }
-function endSession(){if(me){lsDel(K("docs"));lsDel(K("out"));lsDel(K("pull"))}lsDel("cc-last");me=null;docs={};outbox=[];lastPull="";showAuth("login")}
+function endSession(){
+  if(me){lsDel(K("docs"));lsDel(K("ajenos"));lsDel(K("out"));lsDel(K("pull"))}
+  lsDel("cc-last");me=null;docs={};ajenos={};grupos=[];miembros=[];outbox=[];lastPull="";showAuth("login");
+}
 
 /* ---------- Pantalla de acceso ---------- */
 const authEl=document.getElementById("auth"),appEl=document.getElementById("app");
@@ -384,7 +424,7 @@ function importar(file){
 }
 
 /* ---------- Cálculos ---------- */
-const gastos=()=>Object.entries(docs).filter(([,d])=>d.t==="gasto").map(([id,d])=>({id,...d}));
+const gastos=()=>[...Object.entries(docs),...Object.entries(ajenos)].filter(([,d])=>d.t==="gasto").map(([id,d])=>({id,...d}));
 const creditos=()=>Object.entries(docs).filter(([,d])=>d.t==="credito").map(([id,d])=>({id,...d}));
 const logs=()=>Object.values(docs).filter(d=>d.t==="log").flatMap(d=>d.items?d.items:[d]).sort((a,b)=>b.ts.localeCompare(a.ts));
 function cuotaCalc(P,tea,n){P=+P;n=+n;if(!P||!n)return 0;const i=Math.pow(1+(+tea||0)/100,1/12)-1;return i?P*i/(1-Math.pow(1+i,-n)):P/n}
@@ -405,7 +445,7 @@ function credInfo(c){
 const esPresto=c=>c.dir==="presto";
 
 /* ---------- Vistas ---------- */
-let tab="resumen";let mesSel=ym(today());let fCat="";let fTxt="";let hTipo="";let hTxt="";
+let tab="resumen";let mesSel=ym(today());let fCat="";let fAmb="";let fTxt="";let hTipo="";let hTxt="";
 const view=document.getElementById("view");const fab=document.getElementById("fab");
 
 function render(){
@@ -459,6 +499,7 @@ function emptyState(){return`<div class="empty" style="margin-bottom:20px"><stro
 function vGastos(){
   let gs=gastos().filter(g=>ym(g.fecha)===mesSel);
   if(fCat)gs=gs.filter(g=>g.cat===fCat);
+  if(fAmb)gs=gs.filter(g=>fAmb==="p"?!g.grupo:g.grupo===fAmb);
   if(fTxt){const q=fTxt.toLowerCase();gs=gs.filter(g=>(g.desc+" "+g.cat+" "+(g.metodo||"")).toLowerCase().includes(q))}
   gs.sort((a,b)=>b.fecha.localeCompare(a.fecha)||(b.creado||"").localeCompare(a.creado||""));
   const total=gs.reduce((s,g)=>s+(+g.monto||0),0);
@@ -466,14 +507,16 @@ function vGastos(){
   return`
   <div class="toolbar"><h2 style="flex:1 1 100%">Gastos · <span class="num" style="color:var(--gasto)">${money(total)}</span></h2>
     ${monthPicker()}
+    <button class="btn" data-act="grupos">Grupos</button>
+    <select id="famb" aria-label="Ámbito"><option value="">Todo</option><option value="p" ${fAmb==="p"?"selected":""}>Personal</option>${grupos.map(x=>`<option value="${x.id}" ${fAmb===x.id?"selected":""}>${esc(x.nombre)}</option>`).join("")}</select>
     <select id="fcat" aria-label="Categoría"><option value="">Todas las categorías</option>${CATS.map(c=>`<option ${c===fCat?"selected":""}>${c}</option>`).join("")}</select>
     <input id="ftxt" type="search" placeholder="Buscar descripción…" value="${esc(fTxt)}" aria-label="Buscar">
   </div>
   ${gs.length?Object.entries(byDay).map(([d,arr])=>`<div class="day"><div class="label"><span>${fDate(d)}</span><span class="num">${money(arr.reduce((s,g)=>s+(+g.monto||0),0))}</span></div><div class="rows">${arr.map(g=>`
     <div class="row"><div class="ic">${esc(g.cat.slice(0,2).toUpperCase())}</div>
-      <div style="min-width:0"><div class="t">${esc(g.desc||g.cat)}</div><div class="s">${esc(g.cat)}${g.metodo?" · "+esc(g.metodo):""}${g.editado?" · editado":""}</div></div>
+      <div style="min-width:0"><div class="t">${esc(g.desc||g.cat)}</div><div class="s">${esc(g.cat)}${g.metodo?" · "+esc(g.metodo):""}${g.editado?" · editado":""}${g.grupo?" · Grupo: "+esc(gNombre(g.grupo)):""}${g._by?" · registró "+esc(emailDe(g._by)):""}</div></div>
       <div class="amt neg">−${money(g.monto)}</div>
-      <button class="btn ghost" data-act="edit-gasto" data-id="${g.id}" aria-label="Editar gasto">Editar</button></div>`).join("")}</div></div>`).join("")
+      ${g._by?"":`<button class="btn ghost" data-act="edit-gasto" data-id="${g.id}" aria-label="Editar gasto">Editar</button>`}</div>`).join("")}</div></div>`).join("")
   :`<div class="empty"><strong>No hay gastos ${fCat||fTxt?"con ese filtro":"en "+fMonth(mesSel)}</strong><button class="btn primary" data-act="nuevo-gasto">+ Registrar gasto</button></div>`}`;
 }
 
@@ -510,6 +553,41 @@ function vHistorial(){
   :`<div class="empty"><strong>Aún no hay actividad</strong><span>Cada vez que crees, edites, pagues o elimines algo aparecerá aquí con fecha y hora.</span></div>`}`;
 }
 
+/* ---------- Grupos compartidos ---------- */
+function msgErr(e){
+  const m=String(e&&e.message||"");
+  if(/no tiene cuenta/i.test(m))return"Esa persona aún no tiene cuenta. Pídele que se registre primero.";
+  if(/Solo quien creó/i.test(m))return"Solo quien creó el grupo puede invitar.";
+  if(/Inicia sesión/i.test(m))return"Inicia sesión primero.";
+  return"No se pudo completar. Revisa tu conexión e inténtalo de nuevo.";
+}
+function formGrupos(msg){
+  const yo=me&&me.id;
+  const lista=grupos.map(g=>{
+    const ms=miembros.filter(m=>m.grupo_id===g.id);const soy=g.creado_por===yo;
+    return`<div class="cred" style="gap:8px">
+      <div class="hd"><div style="min-width:0"><h3>${esc(g.nombre)}</h3><div class="muted" style="font-size:.82rem">${soy?"Creado por ti":"Creado por "+esc(emailDe(g.creado_por))} · ${ms.length} miembro(s)</div></div></div>
+      <div class="muted" style="font-size:.85rem;overflow-wrap:anywhere">${ms.map(m=>esc(m.email)+(m.user_id===yo?" (tú)":"")).join(", ")}</div>
+      ${soy?`<form class="inv" data-gid="${g.id}" style="display:flex;gap:8px;flex-wrap:wrap"><input type="email" name="correo" required placeholder="Correo de la persona" style="flex:1 1 180px"><button class="btn" type="submit">Invitar</button></form>`:""}
+    </div>`}).join("");
+  open(`<div style="display:flex;flex-direction:column;gap:14px">
+    <h2>Grupos compartidos</h2>
+    <p class="muted" style="margin:0">Los gastos de grupo los ven todos los miembros. Solo quien los registró puede editarlos. Para invitar, la otra persona debe tener su cuenta creada.</p>
+    ${msg?`<p class="err" role="alert">${esc(msg)}</p>`:""}
+    ${lista||`<p class="muted" style="margin:0">Aún no tienes grupos.</p>`}
+    <form id="ng" style="display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:14px">
+      <label class="label" for="ng-n">Nuevo grupo</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><input id="ng-n" name="nombre" maxlength="40" required placeholder="Ej. Casa, Pareja" style="flex:1 1 180px"><button class="btn primary" type="submit">Crear</button></div>
+    </form>
+    <div class="foot"><div class="r"><button type="button" class="btn" data-close>Cerrar</button></div></div>
+  </div>`);
+  sheet.querySelector("#ng").addEventListener("submit",async e=>{e.preventDefault();
+    const n=sheet.querySelector("#ng-n").value.trim();if(!n)return;
+    try{await crearGrupo(n);toast("Grupo creado");formGrupos()}catch(err){formGrupos(msgErr(err))}});
+  sheet.querySelectorAll("form.inv").forEach(f=>f.addEventListener("submit",async e=>{e.preventDefault();
+    try{await invitar(f.dataset.gid,f.querySelector("[name=correo]").value.trim());toast("Persona agregada al grupo");formGrupos()}catch(err){formGrupos(msgErr(err))}}));
+}
+
 /* ---------- Formularios ---------- */
 const overlay=document.getElementById("overlay");const sheet=document.getElementById("sheet");
 function open(html){sheet.innerHTML=html;overlay.hidden=false;const f=sheet.querySelector("input,select");if(f)setTimeout(()=>f.focus(),30)}
@@ -526,13 +604,14 @@ function formGasto(id){
       <div class="field"><label for="g-fecha">Fecha</label><input id="g-fecha" name="fecha" type="date" required value="${g.fecha}"></div>
       <div class="field"><label for="g-cat">Categoría</label><select id="g-cat" name="cat">${CATS.map(c=>`<option ${c===g.cat?"selected":""}>${c}</option>`).join("")}</select></div>
       <div class="field"><label for="g-met">Método de pago</label><select id="g-met" name="metodo">${METODOS.map(c=>`<option ${c===g.metodo?"selected":""}>${c}</option>`).join("")}</select></div>
+      <div class="field"><label for="g-amb">Ámbito</label><select id="g-amb" name="grupo"><option value="">Personal</option>${grupos.map(x=>`<option value="${x.id}" ${x.id===(g.grupo||"")?"selected":""}>${esc(x.nombre)}</option>`).join("")}</select></div>
       <div class="field full"><label for="g-desc">Descripción</label><input id="g-desc" name="desc" maxlength="120" placeholder="Ej. Mercado San Camilo" value="${esc(g.desc)}"></div>
     </div>
     <div id="cf"></div>
     <div class="foot">${id?`<button type="button" class="btn danger" id="g-del">Eliminar</button>`:""}<div class="r"><button type="button" class="btn" data-close>Cancelar</button><button class="btn primary" type="submit">${id?"Guardar cambios":"Agregar gasto"}</button></div></div>
   </div></form>`);
   sheet.querySelector("#fg").addEventListener("submit",e=>{e.preventDefault();const f=new FormData(e.target);
-    const d={t:"gasto",fecha:f.get("fecha"),monto:Math.round(+f.get("monto")*100)/100,cat:f.get("cat"),metodo:f.get("metodo"),desc:(f.get("desc")||"").trim()};
+    const d={t:"gasto",fecha:f.get("fecha"),monto:Math.round(+f.get("monto")*100)/100,cat:f.get("cat"),metodo:f.get("metodo"),desc:(f.get("desc")||"").trim(),grupo:f.get("grupo")||null};
     if(!(d.monto>0))return;
     if(id){const old=docs[id];put(id,{...old,...d,editado:new Date().toISOString()});
       const ch=[];if(old.monto!==d.monto)ch.push(`monto ${money(old.monto)} → ${money(d.monto)}`);if(old.fecha!==d.fecha)ch.push(`fecha ${fDate(old.fecha)} → ${fDate(d.fecha)}`);if(old.cat!==d.cat)ch.push(`categoría → ${d.cat}`);if(old.desc!==d.desc)ch.push("descripción");
@@ -614,14 +693,14 @@ document.getElementById("tabs").addEventListener("click",e=>{const b=e.target.cl
 fab.onclick=()=>tab==="creditos"?formCredito():formGasto();
 sheet.addEventListener("click",e=>{if(e.target.closest("[data-close]"))close()});
 view.addEventListener("click",e=>{const b=e.target.closest("[data-act]");if(!b)return;const a=b.dataset.act,id=b.dataset.id;
-  if(a==="nuevo-gasto")formGasto();else if(a==="nuevo-credito")formCredito();else if(a==="nuevo-prestamo")formCredito(null,"presto");else if(a==="edit-gasto")formGasto(id);
+  if(a==="grupos")formGrupos();else if(a==="nuevo-gasto")formGasto();else if(a==="nuevo-credito")formCredito();else if(a==="nuevo-prestamo")formCredito(null,"presto");else if(a==="edit-gasto")formGasto(id);
   else if(a==="edit-credito")formCredito(id);else if(a==="pago")formPago(id);else if(a==="ejemplo")cargarEjemplo();
   else if(a==="del-pago"){const c=docs[id];const p=(c.pagos||[]).find(x=>x.id===b.dataset.pid);if(!p)return;
     if(b.dataset.armed!=="1"){b.dataset.armed="1";b.textContent="¿Quitar?";setTimeout(()=>{if(b.isConnected){b.dataset.armed="";b.textContent="×"}},3000);return}
     put(id,{...c,pagos:c.pagos.filter(x=>x.id!==p.id)});log(esPresto(c)?"quitar-cobro":"quitar-pago","credito",`${c.nombre} · ${fDate(p.fecha)}`,p.monto);toast(esPresto(c)?"Cobro quitado":"Pago quitado")}
 });
 view.addEventListener("input",e=>{const t=e.target;
-  if(t.id==="mes"&&t.value){mesSel=t.value;render()}else if(t.id==="fcat"){fCat=t.value;render()}else if(t.id==="ftxt"){fTxt=t.value;render()}
+  if(t.id==="mes"&&t.value){mesSel=t.value;render()}else if(t.id==="fcat"){fCat=t.value;render()}else if(t.id==="famb"){fAmb=t.value;render()}else if(t.id==="ftxt"){fTxt=t.value;render()}
   else if(t.id==="htipo"){hTipo=t.value;render()}else if(t.id==="htxt"){hTxt=t.value;render()}});
 
 document.getElementById("btnExp").onclick=exportar;
